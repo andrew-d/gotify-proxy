@@ -6,9 +6,10 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -22,27 +23,34 @@ var (
 	ntfyAddr    = pflag.String("ntfy-addr", "", "address of ntfy to proxy to")
 	accessToken = pflag.String("access-token", "", "gotify access token to expect")
 	tags        = pflag.StringSlice("tags", nil, "tags to add to all messages")
+	verbose     = pflag.Bool("verbose", false, "enable verbose logging")
 
 	ntfyURL *url.URL // parsed from ntfyAddr
+
+	logger = slog.Default()
 )
 
 func main() {
 	pflag.Parse()
 
 	if *addr == "" {
-		log.Fatal("addr is required")
+		fatal("addr is required")
 	}
 	if *ntfyAddr == "" {
-		log.Fatal("ntfy-addr is required")
+		fatal("ntfy-addr is required")
 	}
 	if *accessToken == "" {
-		log.Fatal("access-token is required")
+		fatal("access-token is required")
+	}
+
+	if *verbose {
+		slog.SetLogLoggerLevel(slog.LevelDebug)
 	}
 
 	if u, err := url.ParseRequestURI(*ntfyAddr); err == nil {
 		ntfyURL = u
 	} else {
-		log.Fatalf("invalid ntfy address: %v", err)
+		fatal("invalid ntfy address", slog.String("addr", *ntfyAddr), errAttr(err))
 	}
 
 	mux := http.NewServeMux()
@@ -65,14 +73,17 @@ func main() {
 	go func() {
 		errCh <- srv.ListenAndServe()
 	}()
-	defer log.Printf("gotify-proxy finished")
+	defer logger.Info("gotify-proxy finished")
 
-	log.Printf("gotify-proxy is listening on %s", *addr)
+	logger.Info("gotify-proxy is listening",
+		slog.String("addr", srv.Addr),
+		slog.String("ntfy_addr", ntfyURL.String()),
+	)
 	select {
 	case err := <-errCh:
-		log.Fatalf("error starting server: %v", err)
+		fatal("error starting server", errAttr(err))
 	case <-ctx.Done():
-		log.Printf("shutting down")
+		logger.Info("shutting down")
 	}
 
 	// Try a graceful shutdown then a hard one.
@@ -84,9 +95,9 @@ func main() {
 		return
 	}
 
-	log.Printf("error shutting down gracefully: %v", err)
+	logger.Error("error shutting down gracefully", errAttr(err))
 	if err := srv.Close(); err != nil {
-		log.Printf("error during hard shutdown: %v", err)
+		logger.Error("error during hard shutdown", errAttr(err))
 	}
 }
 
@@ -96,8 +107,14 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log := logger.With(
+		slog.String("topic", topic),
+		slog.String("remote_addr", r.RemoteAddr),
+	)
+
 	// Verify that the request is a JSON request.
 	if r.Header.Get("Content-Type") != "application/json" {
+		log.Debug("invalid content type", slog.String("content_type", r.Header.Get("Content-Type")))
 		writeGotifyError(w, http.StatusUnsupportedMediaType, "only application/json is supported")
 		return
 	}
@@ -106,6 +123,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	// out what we're sending.
 	var reqBody gotifyCreateMessageRequest
 	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+		log.Warn("error decoding request body", errAttr(err))
 		writeGotifyError(w, http.StatusUnauthorized, "invalid request body")
 		return
 	}
@@ -138,14 +156,23 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	// Make the request to ntfy.
 	ntfyResp, err := http.DefaultClient.Do(ntfyReq)
 	if err != nil {
+		log.Error("error sending message to ntfy", errAttr(err))
 		writeGotifyError(w, http.StatusBadGateway, "error sending message to ntfy")
 		return
 	}
 	defer ntfyResp.Body.Close()
 
+	// Verify that we get a valid response from ntfy.
+	if ntfyResp.StatusCode != http.StatusOK {
+		log.Warn("ntfy returned an error", slog.Int("status_code", ntfyResp.StatusCode))
+		writeGotifyError(w, ntfyResp.StatusCode, "error sending message to ntfy")
+		return
+	}
+
 	// Decode the ntfy response and return it to the client.
 	var ntfyRespBody ntfyPublishResponse
 	if err := json.NewDecoder(ntfyResp.Body).Decode(&ntfyRespBody); err != nil {
+		log.Error("error decoding ntfy response", errAttr(err))
 		writeGotifyError(w, http.StatusInternalServerError, "error decoding ntfy response")
 		return
 	}
@@ -168,11 +195,20 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(respBody); err != nil {
+		log.Error("error encoding response", errAttr(err))
 		writeGotifyError(w, http.StatusInternalServerError, "error encoding response")
 		return
 	}
 
 	// All done!
+	attrs := []any{
+		slog.String("ntfy_id", ntfyRespBody.ID),
+		slog.Int("priority", reqBody.Priority),
+	}
+	if reqBody.Title != "" {
+		attrs = append(attrs, slog.String("title", reqBody.Title))
+	}
+	log.Info("message sent to ntfy", attrs...)
 }
 
 // checkAuth will check the request for an access token and return the ntfy
@@ -188,6 +224,7 @@ func checkAuth(w http.ResponseWriter, r *http.Request) (topic string, ok bool) {
 		token = strings.TrimPrefix(hdr, "Bearer ")
 	}
 	if token == "" {
+		logger.Warn("no Gotify token provided")
 		writeGotifyError(w, http.StatusUnauthorized, "you need to provide a valid access token or user credentials to access this api")
 		return "", false
 	}
@@ -198,10 +235,12 @@ func checkAuth(w http.ResponseWriter, r *http.Request) (topic string, ok bool) {
 	// part as the topic.
 	auth, topic, ok := strings.Cut(token, "/")
 	if !ok {
+		logger.Warn("invalid Gotify token format; no slash")
 		writeGotifyError(w, http.StatusUnauthorized, "you need to provide a valid access token or user credentials to access this api")
 		return "", false
 	}
 	if subtle.ConstantTimeCompare([]byte(auth), []byte(*accessToken)) == 0 {
+		logger.Warn("invalid Gotify token provided; invalid access token")
 		writeGotifyError(w, http.StatusForbidden, "you need to provide a valid access token or user credentials to access this api")
 		return "", false
 	}
@@ -241,6 +280,19 @@ func writeGotifyError(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(errResp)
+}
+
+func fatal(msg string, args ...any) {
+	logger.Error("fatal error: "+msg, args...)
+	os.Exit(1)
+}
+
+func errAttr(err error) slog.Attr {
+	if err == nil {
+		return slog.String("error", "<nil>")
+	}
+
+	return slog.String("error", err.Error())
 }
 
 // gotifyCreateMessageRequest is the request body for creating a message that
