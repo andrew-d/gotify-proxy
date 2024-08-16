@@ -6,3 +6,13 @@ message to a [ntfy](https://ntfy.sh/) server.
 
 I wrote this to be able to use ntfy in Proxmox, since Proxmox only supports
 sending emails or to a Gotify server.
+
+### Usage
+
+```
+gotify-proxy \
+    --addr ":12345" \
+    --ntfy-addr http://ntfy.my-domain.com \
+    --access-token supersecret \
+    --tags gotify-proxy
+```
