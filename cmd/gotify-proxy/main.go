@@ -25,9 +25,16 @@ var (
 func main() {
 	pflag.Parse()
 
+	if *addr == "" {
+		log.Fatal("addr is required")
+	}
 	if *ntfyAddr == "" {
 		log.Fatal("ntfy-addr is required")
 	}
+	if *accessToken == "" {
+		log.Fatal("access-token is required")
+	}
+
 	if u, err := url.ParseRequestURI(*ntfyAddr); err == nil {
 		ntfyURL = u
 	} else {
