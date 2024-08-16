@@ -2,12 +2,16 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"net/url"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/pflag"
@@ -42,10 +46,47 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "gotify-proxy is running, proxying to: %s\n", ntfyURL)
+	})
 	mux.HandleFunc("POST /message", proxyHandler)
 
-	if err := http.ListenAndServe(*addr, mux); err != nil {
-		log.Fatal(err)
+	srv := &http.Server{
+		Handler: mux,
+		Addr:    *addr,
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.ListenAndServe()
+	}()
+	defer log.Printf("gotify-proxy finished")
+
+	log.Printf("gotify-proxy is listening on %s", *addr)
+	select {
+	case err := <-errCh:
+		log.Fatalf("error starting server: %v", err)
+	case <-ctx.Done():
+		log.Printf("shutting down")
+	}
+
+	// Try a graceful shutdown then a hard one.
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+
+	err := srv.Shutdown(shutdownCtx)
+	if err == nil {
+		return
+	}
+
+	log.Printf("error shutting down gracefully: %v", err)
+	if err := srv.Close(); err != nil {
+		log.Printf("error during hard shutdown: %v", err)
 	}
 }
 
